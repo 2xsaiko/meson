@@ -363,6 +363,7 @@ class _BuildTarget(_BaseBuildTarget):
     d_module_versions: T.List[T.Union[str, int]]
     d_unittest: bool
     rust_dependency_map: T.Dict[str, str]
+    swift_interoperability_mode: Literal['c', 'cpp']
     swift_module_name: str
     sources: SourcesVarargsType
     c_args: T.List[str]
@@ -456,6 +457,25 @@ class Library(_BuildTarget, _SharedLibMixin, _StaticLibMixin, _LibraryMixin):
     nasm_shared_args: NotRequired[T.List[str]]
     masm_static_args: NotRequired[T.List[str]]
     masm_shared_args: NotRequired[T.List[str]]
+
+
+class BundleShared(TypedDict):
+
+    bundle_resources: T.Optional[build.StructuredSources]
+    bundle_contents: T.Optional[build.StructuredSources]
+    bundle_extra_binaries: T.Optional[build.StructuredSources]
+    info_plist: T.Optional[T.Union[str, File, build.CustomTarget, build.CustomTargetIndex]]
+
+
+class AppBundle(Executable, BundleShared):
+
+    bundle_exe_dir_name: T.Optional[str]
+    bundle_layout: T.Optional[str]
+
+
+class FrameworkBundle(SharedLibrary, BundleShared):
+
+    pass
 
 
 class BuildTarget(Library):
