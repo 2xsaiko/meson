@@ -131,6 +131,9 @@ def main() -> int:
     if opts.clear:
         print('\x1bc', end='', flush=True)
 
+    if not opts.mypy:
+        check_mypy()
+
     to_check = [] # type: T.List[str]
     additional_to_check = [] # type: T.List[str]
     if opts.files:
