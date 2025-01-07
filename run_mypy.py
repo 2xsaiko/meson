@@ -110,8 +110,6 @@ def check_mypy() -> None:
         sys.exit(1)
 
 def main() -> int:
-    check_mypy()
-
     root = Path(__file__).absolute().parent
 
     parser = argparse.ArgumentParser(description='Process some integers.')
@@ -128,6 +126,9 @@ def main() -> int:
 
     if opts.clear:
         print('\x1bc', end='', flush=True)
+
+    if not opts.mypy:
+        check_mypy()
 
     to_check = [] # type: T.List[str]
     additional_to_check = [] # type: T.List[str]
