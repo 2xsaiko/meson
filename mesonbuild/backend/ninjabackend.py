@@ -23,6 +23,7 @@ from .. import modules
 from .. import environment, mesonlib
 from .. import build
 from .. import mlog
+from .. import nsbundle
 from .. import compilers
 from ..arglist import CompilerArgs
 from ..compilers import Compiler
@@ -491,6 +492,7 @@ class NinjaBackend(backends.Backend):
         self.created_llvm_ir_rule = PerMachine(False, False)
         self.rust_crates: T.Dict[str, RustCrate] = {}
         self.implicit_meson_outs: T.List[str] = []
+        self.compdb_special_targets: T.List[T.Tuple[NinjaBuildElement, T.List[str]]] = []
         self._uses_dyndeps = False
         self._generated_header_cache: T.Dict[str, T.List[FileOrString]] = {}
         # nvcc chokes on thin archives:
@@ -730,9 +732,34 @@ class NinjaBackend(backends.Backend):
         builddir = self.environment.get_build_dir()
         try:
             jsondb = subprocess.check_output(ninja_compdb, cwd=builddir)
-            with open(os.path.join(builddir, 'compile_commands.json'), 'wb') as f:
-                f.write(jsondb)
-        except Exception:
+            jsondb_data = json.loads(jsondb)
+            # Ninja's generated compilation database only includes the first input file for each build element. In order
+            # to have LSPs like Swift's (which compiles multiple files per command invocation) pick it up, explicitly
+            # list all of the files here.
+            for t, extra_infilenames in self.compdb_special_targets:
+                arguments = []
+                for argument in t.rule.command:
+                    # Most likely not 100% correct, but it doesn't have to be since most targets won't use this.
+                    # Extend it if needed
+                    if argument.s == '$in' and argument.quoting == Quoting.none:
+                        arguments += t.infilenames
+                    elif argument.s == '$out' and argument.quoting == Quoting.none:
+                        arguments += t.outfilenames
+                    elif argument.s.startswith('$') and argument.quoting == Quoting.none:
+                        iterator = iter(t.elems)
+                        while True:
+                            k, v = next(iterator)
+                            if k == argument.s[1:]:
+                                arguments += v
+                                break
+                    else:
+                        arguments.append(argument.s)
+                for file in itertools.chain(t.infilenames, extra_infilenames):
+                    d = {'directory': builddir, 'arguments': arguments, 'file': file}
+                    jsondb_data += [d]
+            with open(os.path.join(builddir, 'compile_commands.json'), 'w', encoding='utf-8') as f:
+                json.dump(jsondb_data, f, indent=2)
+        except (subprocess.CalledProcessError, OSError):
             mlog.warning('Could not create compilation database.', fatal=False)
 
     # Get all generated headers. Any source file might need them so
@@ -878,6 +905,8 @@ class NinjaBackend(backends.Backend):
             self.generate_custom_target(target)
         if isinstance(target, build.RunTarget):
             self.generate_run_target(target)
+        if isinstance(target, build.BundleTarget):
+            return self.generate_bundle_target3(target)
         compiled_sources: T.List[str] = []
         source2object: T.Dict[str, str] = {}
         name = target.get_id()
@@ -901,9 +930,6 @@ class NinjaBackend(backends.Backend):
             return
         if 'cs' in target.compilers:
             self.generate_cs_target(target)
-            return
-        if 'swift' in target.compilers:
-            self.generate_swift_target(target)
             return
 
         # CompileTarget compiles all its sources and does not do a final link.
@@ -937,7 +963,11 @@ class NinjaBackend(backends.Backend):
         self.scan_fortran_module_outputs(target)
 
         # Generate rules for building the remaining source files in this target
-        outname = self.get_target_filename(target)
+        if isinstance(target, build.BundleTargetBase):
+            outname = os.path.join(self.get_target_private_dir(target), target.get_executable_name())
+        else:
+            outname = self.get_target_filename(target)
+
         obj_list = []
         is_unity = self.is_unity(target)
         header_deps = []
@@ -985,6 +1015,29 @@ class NinjaBackend(backends.Backend):
         # For D language, the object of generated source files are added
         # as order only deps because other files may depend on them
         d_generated_deps = []
+
+        # Swiftc wants a single compiler invocation for all of the source files. Filter out relevant
+        # sources here.
+        if 'swift' in target.compilers:
+            swiftc = target.compilers['swift']
+            swift_generated_sources = [file for file in generated_source_files if swiftc.can_compile(file)]
+            generated_source_files[:] = [file for file in generated_source_files if file not in swift_generated_sources]
+            swift_sources = {}
+            for path, file in target_sources.items():
+                if swiftc.can_compile(file):
+                    swift_sources[path] = file
+            for path in swift_sources:
+                del target_sources[path]
+            objs, swift_generated_header = self.generate_swift_compile(target, swift_sources, swift_generated_sources, target_sources, generated_source_files)
+            obj_list.extend(objs)
+
+            if swift_generated_header and any(lang in target.compilers for lang in ['objc', 'cpp', 'objcpp']):
+                header_deps.append(swift_generated_header)
+
+        # For linking with a Swift target in a Obj-C/C++ target, include the Swift target's generated header.
+        if any(lang in target.compilers for lang in ['objc', 'cpp', 'objcpp']):
+            for header in self.determine_swift_dep_headers(target):
+                header_deps.append(header)
 
         # These are the generated source files that need to be built for use by
         # this target. We create the Ninja build file elements for this here
@@ -1102,6 +1155,9 @@ class NinjaBackend(backends.Backend):
             if target.aix_so_archive:
                 elem = NinjaBuildElement(self.all_outputs, linker.get_archive_name(outname), 'AIX_LINKER', [outname])
                 self.add_build(elem)
+
+        if isinstance(target, build.BundleTargetBase):
+            self.generate_bundle_target(target, elem.outfilenames[0])
 
     def should_use_dyndeps_for_target(self, target: 'build.BuildTarget') -> bool:
         if not self.ninja_has_dyndeps:
@@ -1394,6 +1450,10 @@ class NinjaBackend(backends.Backend):
                                 extra='restat = 1'))
         self.add_rule(NinjaRule('COPY_FILE', self.environment.get_build_command() + ['--internal', 'copy'],
                                 ['$in', '$out'], 'Copying $in to $out'))
+        self.add_rule(NinjaRule('SYMLINK_FILE', self.environment.get_build_command() + ['--internal', 'symlink'],
+                                ['$TARGET', '$out'], 'Creating symlink $out -> $TARGET'))
+        self.add_rule(NinjaRule('MERGE_PLIST', self.environment.get_build_command() + ['--internal', 'merge-plist'],
+                                ['$out', '$in'], 'Merging plist $in to $out'))
 
         c = self.environment.get_build_command() + \
             ['--internal',
@@ -1501,6 +1561,104 @@ class NinjaBackend(backends.Backend):
         self.add_build(elem)
         # Create introspection information
         self.create_target_source_introspection(target, compiler, compile_args, src_list, gen_src_list)
+
+    def generate_bundle_target(self, target: build.BundleTargetBase, main_exe: str) -> None:
+        bi: nsbundle.BundleInfo = target.get_bundle_info()
+
+        main_exe_dir, main_exe_fname = os.path.split(main_exe)
+        bundle_rel = self.get_target_filename(target)
+
+        presets_path = os.path.join(self.get_target_private_dir(target), 'Presets', 'Info.plist')
+        presets_fullpath = os.path.join(self.environment.get_build_dir(), presets_path)
+        os.makedirs(os.path.dirname(presets_fullpath), exist_ok=True)
+
+        with open(presets_fullpath, 'wb') as fp:
+            import plistlib
+
+            d = bi.get_configured_info_dict()
+            plistlib.dump(d, fp)
+
+        presets_file = File(True, *os.path.split(presets_path))
+
+        if bi.info_dict_file:
+            info_plist = self.generate_merge_plist(target, 'Info.plist', [presets_file, bi.info_dict_file])
+        else:
+            info_plist = presets_file
+
+        layout = build.StructuredSources()
+        layout.sources[str(bi.get_executable_folder_path())] += [File(True, main_exe_dir, main_exe_fname)]
+        layout.sources[str(bi.get_infoplist_path())] += [info_plist]
+
+        if bi.resources is not None:
+            for k, v in bi.resources.sources.items():
+                layout.sources[str(bi.get_unlocalized_resources_folder_path() / k)] += v
+
+        if bi.contents is not None:
+            for k, v in bi.contents.sources.items():
+                layout.sources[str(bi.get_contents_folder_path() / k)] += v
+
+        if bi.headers is not None:
+            for k, v in bi.headers.sources.items():
+                layout.sources[str(bi.get_public_headers_folder_path() / k)] += v
+
+        if bi.extra_binaries is not None:
+            for v in bi.extra_binaries:
+                layout.sources[str(bi.get_executable_folder_path())] += v
+
+        for file in layout.as_list():
+            if isinstance(file, GeneratedList):
+                self.generate_genlist_for_target(file, target)
+
+        elem = NinjaBuildElement(self.all_outputs, bundle_rel, 'phony', [])
+        elem.add_orderdep(self.__generate_sources_structure(Path(bundle_rel), layout, target=target)[0])
+
+        # Create links for versioned bundles (frameworks only)
+        def make_relative_link(src: PurePath, dst: PurePath):
+            src_rel = src.relative_to(dst.parent, walk_up=True)
+            dst_path = Path(bundle_rel) / dst
+            elem.add_orderdep(str(dst_path))
+            self._generate_symlink_target(str(src_rel), dst_path)
+
+        contents_dir = bi.get_contents_folder_path()
+
+        for path in bi.get_paths_to_link_contents():
+            can_link_whole_dir = True
+
+            for d in layout.sources.keys():
+                if PurePath(d).is_relative_to(path):
+                    can_link_whole_dir = False
+                    break
+
+            if can_link_whole_dir:
+                make_relative_link(contents_dir, path)
+            else:
+                names = set()
+
+                for d in layout.sources.keys():
+                    d = PurePath(d)
+
+                    if not d.parent.is_relative_to(contents_dir):
+                        continue
+
+                    d = d.relative_to(contents_dir).parts[0]
+                    names.add(d)
+
+                for file in layout.sources[str(contents_dir)]:
+                    if isinstance(file, File):
+                        names.add(PurePath(file.fname).parts[0])
+                    else:
+                        names.update(file.get_outputs())
+
+                for n in names:
+                    assert n != '.'
+
+                    make_relative_link(contents_dir / n, path / n)
+
+        self.add_build(elem)
+
+    def generate_bundle_target3(self, target: build.BundleTarget) -> None:
+        main_exe = os.path.join(self.get_target_dir(target.main_exe), target.main_exe.get_filename())
+        self.generate_bundle_target(target, main_exe)
 
     def generate_cs_resource_tasks(self, target) -> T.Tuple[T.List[str], T.List[str]]:
         args = []
@@ -1883,14 +2041,20 @@ class NinjaBackend(backends.Backend):
     def _generate_copy_target(self, src: FileOrString, output: Path) -> None:
         """Create a target to copy a source file from one location to another."""
         if isinstance(src, File):
-            instr = src.absolute_path(self.environment.source_dir, self.environment.build_dir)
+            instr = src.rel_to_builddir(self.build_to_src)
         else:
             instr = src
         elem = NinjaBuildElement(self.all_outputs, [str(output)], 'COPY_FILE', [instr])
         elem.add_orderdep(instr)
         self.add_build(elem)
 
-    def __generate_sources_structure(self, root: Path, structured_sources: build.StructuredSources) -> T.Tuple[T.List[str], T.Optional[str]]:
+    def _generate_symlink_target(self, src: str, output: Path) -> None:
+        """Create a target to create a symbolic link."""
+        elem = NinjaBuildElement(self.all_outputs, [str(output)], 'SYMLINK_FILE', [])
+        elem.add_item('TARGET', src)
+        self.add_build(elem)
+
+    def __generate_sources_structure(self, root: Path, structured_sources: build.StructuredSources, target: T.Optional[build.Target] = None) -> T.Tuple[T.List[str], T.Optional[str]]:
         first_file: T.Optional[str] = None
         orderdeps: T.List[str] = []
         for path, files in structured_sources.sources.items():
@@ -1902,10 +2066,18 @@ class NinjaBackend(backends.Backend):
                     if first_file is None:
                         first_file = str(out)
                 else:
+                    if isinstance(file, GeneratedList):
+                        if target is None:
+                            raise MesonBugException('Encountered GeneratedList in StructuredSources with None target')
+
+                        srcdir = Path(self.get_target_private_dir(target))
+                    else:
+                        srcdir = Path(file.subdir)
+
                     for f in file.get_outputs():
                         out = root / path / f
                         orderdeps.append(str(out))
-                        self._generate_copy_target(str(Path(file.subdir) / f), out)
+                        self._generate_copy_target(str(srcdir / f), out)
                         if first_file is None:
                             first_file = str(out)
         return orderdeps, first_file
@@ -2231,39 +2403,58 @@ class NinjaBackend(backends.Backend):
     def compiler_to_pch_rule_name(cls, compiler: Compiler) -> str:
         return cls.get_compiler_rule_name(compiler.get_language(), compiler.for_machine, 'PCH')
 
-    def swift_module_file_name(self, target):
+    def swift_module_file_name(self, target: build.BuildTarget):
         return os.path.join(self.get_target_private_dir(target),
                             target.swift_module_name + '.swiftmodule')
 
-    def determine_swift_dep_modules(self, target):
+    def swift_generated_header_file_name(self, target: build.BuildTarget):
+        return os.path.join(self.get_target_private_dir(target),
+                            target.swift_module_name + '-Swift.h')
+
+    def determine_swift_dep_modules(self, target: build.BuildTarget):
         result = []
         for l in target.link_targets:
             if self.is_swift_target(l):
                 result.append(self.swift_module_file_name(l))
         return result
 
-    def get_swift_link_deps(self, target):
+    def determine_swift_dep_headers(self, target: build.BuildTarget):
         result = []
         for l in target.link_targets:
-            result.append(self.get_target_filename(l))
+            if self.is_swift_target(l):
+                result.append(self.swift_generated_header_file_name(l))
         return result
 
-    def split_swift_generated_sources(self, target):
-        all_srcs = self.get_target_generated_sources(target)
-        srcs = []
-        others = []
-        for i in all_srcs:
-            if i.endswith('.swift'):
-                srcs.append(i)
-            else:
-                others.append(i)
-        return srcs, others
+    def generate_swift_compile(self, target: build.BuildTarget,
+                               swift_sources: T.OrderedMapping[str, File], swift_generated_sources: T.List[File],
+                               sources: T.OrderedMapping[str, File], generated_sources: T.List[File]) -> T.Tuple[T.List[str], T.Optional[File]]:
+        if not swift_sources and not swift_generated_sources:
+            return [], None
 
-    def generate_swift_target(self, target) -> None:
-        module_name = target.swift_module_name
         swiftc = target.compilers['swift']
+
         abssrc = []
         relsrc = []
+        for i in swift_sources.values():
+            rels = i.rel_to_builddir(self.build_to_src)
+            abss = os.path.normpath(os.path.join(self.environment.get_build_dir(), rels))
+            relsrc.append(rels)
+            abssrc.append(abss)
+        abs_generated = []
+        rel_generated = []
+        for i in swift_generated_sources:
+            rels = i.rel_to_builddir(self.build_to_src)
+            abss = os.path.normpath(os.path.join(self.environment.get_build_dir(), rels))
+            rel_generated.append(rels)
+            abs_generated.append(abss)
+
+        # Swift outputs object files in the working directory (target's private dir), named after the input file
+        rel_objects = [] # Relative to build.ninja
+        for i in abssrc + abs_generated:
+            base = os.path.basename(i)
+            oname = os.path.splitext(base)[0] + '.o'
+            rel_objects.append(os.path.join(self.get_target_private_dir(target), oname))
+
         abs_headers = []
         header_imports = []
 
@@ -2280,22 +2471,21 @@ class NinjaBackend(backends.Backend):
                                      'Add "swift_interoperability_mode: \'cpp\'" to the definition of {0}.'
                                      .format(repr(target.name), target_word, first, and_word, last, enable_word))
 
-        for i in target.get_sources():
-            if swiftc.can_compile(i):
-                rels = i.rel_to_builddir(self.build_to_src)
-                abss = os.path.normpath(os.path.join(self.environment.get_build_dir(), rels))
-                relsrc.append(rels)
-                abssrc.append(abss)
-            elif self.environment.is_header(i):
+        for i in itertools.chain(generated_sources, sources.values()):
+            if self.environment.is_header(i):
                 relh = i.rel_to_builddir(self.build_to_src)
                 absh = os.path.normpath(os.path.join(self.environment.get_build_dir(), relh))
                 abs_headers.append(absh)
                 header_imports += swiftc.get_header_import_args(absh)
-            else:
-                raise InvalidArguments(f'Swift target {target.get_basename()} contains a non-swift source file.')
+        if header_imports != [] and not isinstance(target, build.Executable):
+            raise MesonException('C bridging headers are not supported in Swift library targets: {}. '
+                                 'Write a separate Clang module including the necessary headers and add it to this '
+                                 'target\'s include directories.'
+                                 .format(', '.join(repr(x) for x in header_imports)))
         os.makedirs(self.get_target_private_dir_abs(target), exist_ok=True)
+
         compile_args = self.generate_basic_compiler_args(target, swiftc)
-        compile_args += swiftc.get_module_args(module_name)
+        # TODO: export header even when this target doesn't use swift
         compile_args += swiftc.get_cxx_interoperability_args(target)
         compile_args += self.build.get_project_args(swiftc, target.subproject, target.for_machine)
         compile_args += self.build.get_global_args(swiftc, target.for_machine)
@@ -2317,68 +2507,53 @@ class NinjaBackend(backends.Backend):
                 sargs = swiftc.get_include_args(srctreedir, False)
                 compile_args += sargs
         compile_args += target.get_extra_args('swift')
-        link_args = swiftc.get_output_args(os.path.join(self.environment.get_build_dir(), self.get_target_filename(target)))
-        link_args += self.build.get_project_link_args(swiftc, target.subproject, target.for_machine)
-        link_args += self.build.get_global_link_args(swiftc, target.for_machine)
-        rundir = self.get_target_private_dir(target)
+        rundir = self.get_target_private_dir_abs(target)
         out_module_name = self.swift_module_file_name(target)
         in_module_files = self.determine_swift_dep_modules(target)
+
         abs_module_dirs = self.determine_swift_dep_dirs(target)
         module_includes = []
         for x in abs_module_dirs:
             module_includes += swiftc.get_include_args(x, False)
-        link_deps = self.get_swift_link_deps(target)
-        abs_link_deps = [os.path.join(self.environment.get_build_dir(), x) for x in link_deps]
-        for d in target.link_targets:
-            reldir = self.get_target_dir(d)
-            if reldir == '':
-                reldir = '.'
-            link_args += ['-L', os.path.normpath(os.path.join(self.environment.get_build_dir(), reldir))]
-        (rel_generated, _) = self.split_swift_generated_sources(target)
-        abs_generated = [os.path.join(self.environment.get_build_dir(), x) for x in rel_generated]
-        # We need absolute paths because swiftc needs to be invoked in a subdir
-        # and this is the easiest way about it.
-        objects = [] # Relative to swift invocation dir
-        rel_objects = [] # Relative to build.ninja
-        for i in abssrc + abs_generated:
-            base = os.path.basename(i)
-            oname = os.path.splitext(base)[0] + '.o'
-            objects.append(oname)
-            rel_objects.append(os.path.join(self.get_target_private_dir(target), oname))
 
-        rulename = self.compiler_to_rule_name(swiftc)
+        compile_rule = self.compiler_to_rule_name(swiftc)
+        module_rule = self.get_compiler_rule_name(swiftc.get_language(), swiftc.for_machine, 'SWIFTMODULE')
+        header_rule = self.get_compiler_rule_name(swiftc.get_language(), swiftc.for_machine, 'HEADER')
 
         # Swiftc does not seem to be able to emit objects and module files in one go.
-        elem = NinjaBuildElement(self.all_outputs, rel_objects, rulename, abssrc)
+        elem = NinjaBuildElement(self.all_outputs, rel_objects, compile_rule, abssrc)
         elem.add_dep(in_module_files + rel_generated)
         elem.add_dep(abs_headers)
-        elem.add_item('ARGS', swiftc.get_compile_only_args() + compile_args + header_imports + abs_generated + module_includes)
+        elem.add_item('TARGET', target.name)
+        elem.add_item('MODULE', target.swift_module_name)
+        elem.add_item('ARGS', compile_args + header_imports + abs_generated + module_includes)
         elem.add_item('RUNDIR', rundir)
         self.add_build(elem)
+        self.compdb_special_targets.append((elem, rel_generated))
 
         # -g makes swiftc create a .o file with potentially the same name as one of the compile target generated ones.
         mod_gen_args = [el for el in compile_args if el != '-g']
 
-        elem = NinjaBuildElement(self.all_outputs, out_module_name, rulename, abssrc)
+        elem = NinjaBuildElement(self.all_outputs, out_module_name, module_rule, abssrc)
         elem.add_dep(in_module_files + rel_generated)
-        elem.add_item('ARGS', swiftc.get_mod_gen_args() + mod_gen_args + abs_generated + module_includes)
+        elem.add_item('MODULE', target.swift_module_name)
+        elem.add_item('ARGS', mod_gen_args + header_imports + abs_generated + module_includes)
         elem.add_item('RUNDIR', rundir)
         self.add_build(elem)
-        if isinstance(target, build.StaticLibrary):
-            elem = self.generate_link(target, self.get_target_filename(target),
-                                      rel_objects, self.build.static_linker[target.for_machine])
-            self.add_build(elem)
-        elif isinstance(target, build.Executable):
-            elem = NinjaBuildElement(self.all_outputs, self.get_target_filename(target), rulename, [])
-            elem.add_dep(rel_objects)
-            elem.add_dep(link_deps)
-            elem.add_item('ARGS', link_args + swiftc.get_std_exe_link_args() + objects + abs_link_deps)
-            elem.add_item('RUNDIR', rundir)
-            self.add_build(elem)
-        else:
-            raise MesonException('Swift supports only executable and static library targets.')
+
+        # Generate a header for importing into Obj-C/C++.
+        out_header_name = self.swift_generated_header_file_name(target)
+        elem = NinjaBuildElement(self.all_outputs, out_header_name, header_rule, [out_module_name])
+        elem.add_dep(in_module_files)
+        elem.add_item('ARGS', compile_args + module_includes)
+        self.add_build(elem)
+
+        out_header_name_path = PurePath(out_header_name)
+        generated_header = File(True, str(out_header_name_path.parent), out_header_name_path.name)
+
         # Introspection information
         self.create_target_source_introspection(target, swiftc, compile_args + header_imports + module_includes, relsrc, rel_generated)
+        return rel_objects, generated_header
 
     def _rsp_options(self, tool: T.Union['Compiler', 'StaticLinker', 'DynamicLinker']) -> T.Dict[str, T.Union[bool, RSPFileSyntax]]:
         """Helper method to get rsp options.
@@ -2524,7 +2699,6 @@ class NinjaBackend(backends.Backend):
                                 depfile=depfile))
 
     def generate_swift_compile_rules(self, compiler) -> None:
-        rule = self.compiler_to_rule_name(compiler)
         wd_args = compiler.get_working_directory_args('$RUNDIR')
 
         if wd_args is not None:
@@ -2537,8 +2711,36 @@ class NinjaBackend(backends.Backend):
             ]
             invoc = full_exe + compiler.get_exelist()
 
-        command = invoc + ['$ARGS', '$in']
-        description = 'Compiling Swift source $in'
+        rule = self.compiler_to_rule_name(compiler)
+        command = [
+            *invoc,
+            *compiler.get_compile_only_args(),
+            *compiler.get_module_args('$MODULE'),
+            '$ARGS',
+            '$in'
+        ]
+        description = 'Compiling Swift sources for $TARGET'
+        self.add_rule(NinjaRule(rule, command, [], description, extra='restat = 1'))
+
+        rule = self.get_compiler_rule_name(compiler.get_language(), compiler.for_machine, 'SWIFTMODULE')
+        command = [
+            *invoc,
+            *compiler.get_mod_gen_args(),
+            *compiler.get_module_args('$MODULE'),
+            '$ARGS',
+            '$in'
+        ]
+        description = 'Generating Swift module $out'
+        self.add_rule(NinjaRule(rule, command, [], description, extra='restat = 1'))
+
+        rule = self.get_compiler_rule_name(compiler.get_language(), compiler.for_machine, 'HEADER')
+        command = [
+            *compiler.get_exelist(), # don't need $RUNDIR for this one
+            *compiler.get_header_gen_args('$out'),
+            '$ARGS',
+            '$in'
+        ]
+        description = 'Generating C header for Swift module $in'
         self.add_rule(NinjaRule(rule, command, [], description, extra='restat = 1'))
 
     def use_dyndeps_for_fortran(self) -> bool:
@@ -3221,6 +3423,15 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
         if not self.use_dyndeps_for_fortran():
             for i in self.get_fortran_module_deps(target, compiler):
                 element.add_dep(i)
+
+        for lt in itertools.chain(target.link_targets, target.link_whole_targets):
+            # Linking against frameworks also pulls in its headers, therefore wait for it to be assembled. This is not
+            # exactly ideal, since it will also wait for the library to be linked, but it's better than no dep at all.
+            # TODO: check whether linking against framework is possible when only headers have been installed into the
+            # bundle
+            if isinstance(lt, build.FrameworkBundle):
+                element.add_orderdep(self.get_target_filename(lt))
+
         if dep_file:
             element.add_item('DEPFILE', dep_file)
         if compiler.get_language() == 'cuda':
@@ -3407,6 +3618,18 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
             elem.add_item('CROSS', '--cross-host=' + self.environment.machines[target.for_machine].system)
         self.add_build(elem)
 
+    def generate_merge_plist(self, target: build.BuildTarget, out_name: str, in_files: T.List[File]) -> File:
+        out_path = os.path.join(self.get_target_private_dir(target), out_name)
+        elem = NinjaBuildElement(
+            self.all_outputs,
+            out_path,
+            'MERGE_PLIST',
+            [f.rel_to_builddir(self.build_to_src) for f in in_files],
+        )
+        self.add_build(elem)
+
+        return File(True, self.get_target_private_dir(target), out_name)
+
     def get_import_filename(self, target) -> str:
         return Path(self.get_target_dir(target), target.import_filename).as_posix()
 
@@ -3592,6 +3815,11 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
                                                            self.get_target_dir(target))
         else:
             target_slashname_workaround_dir = self.get_target_dir(target)
+
+        if isinstance(target, build.BundleTargetBase):
+            target_slashname_workaround_dir = str(PurePath() / target_slashname_workaround_dir / target.get_filename() /
+                                                  target.get_bundle_info().get_executable_folder_path())
+
         (rpath_args, target.rpath_dirs_to_remove) = (
             linker.build_rpath_args(self.environment,
                                     self.environment.get_build_dir(),
@@ -3776,12 +4004,12 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
             else:
                 self.implicit_meson_outs.append(aliasfile)
 
-    def generate_custom_target_clean(self, trees: T.List[str]) -> str:
+    def generate_dir_target_clean(self, trees: T.List[str]) -> str:
         e = self.create_phony_target('clean-ctlist', 'CUSTOM_COMMAND', 'PHONY')
         d = CleanTrees(self.environment.get_build_dir(), trees)
         d_file = os.path.join(self.environment.get_scratch_dir(), 'cleantrees.dat')
         e.add_item('COMMAND', self.environment.get_build_command() + ['--internal', 'cleantrees', d_file])
-        e.add_item('description', 'Cleaning custom target directories')
+        e.add_item('description', 'Cleaning directory target outputs')
         self.add_build(e)
         # Write out the data file passed to the script
         with open(d_file, 'wb') as ofile:
@@ -3945,6 +4173,7 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
                     if self.environment.machines[t.for_machine].is_aix():
                         linker, stdlib_args = t.get_clink_dynamic_linker_and_stdlibs()
                         t.get_outputs()[0] = linker.get_archive_name(t.get_outputs()[0])
+
                 targetlist.append(os.path.join(self.get_target_dir(t), t.get_outputs()[0]))
 
             elem = NinjaBuildElement(self.all_outputs, targ, 'phony', targetlist)
@@ -3960,14 +4189,13 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
         # instead of files. This is needed because on platforms other than
         # Windows, Ninja only deletes directories while cleaning if they are
         # empty. https://github.com/mesonbuild/meson/issues/1220
-        ctlist = []
+        dir_output_list = []
         for t in self.build.get_targets().values():
-            if isinstance(t, build.CustomTarget):
-                # Create a list of all custom target outputs
-                for o in t.get_outputs():
-                    ctlist.append(os.path.join(self.get_target_dir(t), o))
-        if ctlist:
-            elem.add_dep(self.generate_custom_target_clean(ctlist))
+            for o in t.get_outputs():
+                if t.can_output_be_directory(o):
+                    dir_output_list.append(os.path.join(self.get_target_dir(t), o))
+        if dir_output_list:
+            elem.add_dep(self.generate_dir_target_clean(dir_output_list))
 
         if OptionKey('b_coverage') in self.environment.coredata.optstore and \
            self.environment.coredata.optstore.get_value_for('b_coverage'):

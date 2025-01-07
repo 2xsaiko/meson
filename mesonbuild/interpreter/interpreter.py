@@ -135,6 +135,8 @@ if T.TYPE_CHECKING:
 
     TestClass = T.TypeVar('TestClass', bound=Test)
 
+BT = T.TypeVar('BT', bound=build.BuildTarget)
+
 def _project_version_validator(value: T.Union[T.List, str, mesonlib.File, None]) -> T.Optional[str]:
     if isinstance(value, list):
         if len(value) != 1:
@@ -422,6 +424,9 @@ class Interpreter(InterpreterBase, HoldableObject):
             build.SharedModule: OBJ.SharedModuleHolder,
             build.Executable: OBJ.ExecutableHolder,
             build.Jar: OBJ.JarHolder,
+            build.AppBundle: OBJ.AppBundleHolder,
+            build.FrameworkBundle: OBJ.FrameworkBundleHolder,
+            build.BundleTarget: OBJ.BundleTargetHolder,
             build.CustomTarget: OBJ.CustomTargetHolder,
             build.CustomTargetIndex: OBJ.CustomTargetIndexHolder,
             build.Generator: OBJ.GeneratorHolder,
@@ -479,7 +484,7 @@ class Interpreter(InterpreterBase, HoldableObject):
         for v in invalues:
             if isinstance(v, ObjectHolder):
                 raise InterpreterException('Modules must not return ObjectHolders')
-            if isinstance(v, (build.BuildTarget, build.CustomTarget, build.RunTarget)):
+            if isinstance(v, (build.BuildTarget, build.CustomTarget, build.RunTarget, build.BundleTarget)):
                 self.add_target(v.name, v)
             elif isinstance(v, list):
                 self.process_new_values(v)
@@ -1502,6 +1507,7 @@ class Interpreter(InterpreterBase, HoldableObject):
         args = [a.lower() for a in args]
         langs = set(self.compilers[for_machine].keys())
         langs.update(args)
+        new_langs = set()
         # We'd really like to add cython's default language here, but it can't
         # actually be done because the cython compiler hasn't been initialized,
         # so we can't actually get the option yet. Because we can't know what
@@ -1556,8 +1562,56 @@ class Interpreter(InterpreterBase, HoldableObject):
                            mlog.bold(' '.join(comp.linker.get_exelist())), comp.linker.id, comp.linker.version)
             self.build.ensure_static_linker(comp)
             self.compilers[for_machine][lang] = comp
+            new_langs.add(lang)
+
+        if new_langs:
+            self.did_add_languages_for(for_machine, new_langs)
 
         return success
+
+    def did_add_languages_for(self, for_machine: MachineChoice, new_languages: T.Set[str]):
+        swift_and_cpp = {'swift', 'cpp'}
+        # call this once, after both have been added
+        if all(name in self.compilers[for_machine] for name in swift_and_cpp) and \
+                new_languages.intersection(swift_and_cpp):
+            self.check_cpp_can_import_swift_header(for_machine)
+
+    def check_cpp_can_import_swift_header(self, for_machine: MachineChoice):
+        from mesonbuild.compilers.cpp import CPPCompiler
+        from mesonbuild.compilers.swift import SwiftCompiler
+        from mesonbuild.mesonlib import Popen_safe_logged
+
+        compilers = self.compilers[for_machine]
+
+        swiftc = compilers['swift']
+        cpp = compilers['cpp']
+        assert isinstance(swiftc, SwiftCompiler)
+        assert isinstance(cpp, CPPCompiler)
+
+        if not swiftc.supports_cxx_interoperability():
+            cpp._works_with_swift = False
+            return
+
+        header_name = 'swift-export.h'
+
+        swift_command = [*swiftc.get_exelist(), *swiftc.get_header_gen_args(header_name), *swiftc.get_library_args(),
+                         *swiftc.get_module_args('Check'), *swiftc.get_cxx_interoperability_args(), '-']
+        p, _, _ = Popen_safe_logged(swift_command, cwd=self.environment.get_scratch_dir())
+
+        works, _ = cpp.compiles(f'#include "{header_name}"\nclass breakCCompiler;int main(void) {{ return 0; }}\n',
+                                self.environment, extra_args=[
+                                    # On macOS, the Swift header seems to need at least C++11 standard level. Just use
+                                    # whatever the project has defined as the default.
+                                    *cpp.get_option_compile_args(None, self.environment, None),
+                                    f'-I{self.environment.get_scratch_dir()}'],
+                                disable_cache=True)
+
+        msg = ['C++ compiler', *[mlog.bold(el) for el in cpp.get_exelist()], 'compiles Swift-exported headers:']
+        verbose = for_machine == MachineChoice.HOST or self.environment.is_cross_build()
+        logger_fun = mlog.log if verbose else mlog.debug
+        logger_fun(*msg, mlog.green('YES') if works else mlog.red('NO'))
+
+        cpp._works_with_swift = works
 
     def program_from_file_for(self, for_machine: MachineChoice, prognames: T.List[mesonlib.FileOrString]
                               ) -> T.Optional[ExternalProgram]:
@@ -3254,6 +3308,9 @@ class Interpreter(InterpreterBase, HoldableObject):
         if idname not in self.coredata.target_guids:
             self.coredata.target_guids[idname] = str(uuid.uuid4()).upper()
 
+        if isinstance(tobj, build.BuildTarget):
+            self.project_args_frozen = True
+
     @FeatureNew('both_libraries', '0.46.0')
     def build_both_libraries(self, node: mparser.BaseNode, args: T.Tuple[str, SourcesVarargsType], kwargs: kwtypes.Library) -> build.BothLibraries:
         shared_lib = self.build_target(node, args, kwargs, build.SharedLibrary)
@@ -3376,6 +3433,12 @@ class Interpreter(InterpreterBase, HoldableObject):
                      kwargs: T.Union[kwtypes.Executable, kwtypes.StaticLibrary, kwtypes.SharedLibrary, kwtypes.SharedModule, kwtypes.Jar],
                      targetclass: T.Type[T.Union[build.Executable, build.StaticLibrary, build.SharedModule, build.SharedLibrary, build.Jar]]
                      ) -> T.Union[build.Executable, build.StaticLibrary, build.SharedModule, build.SharedLibrary, build.Jar]:
+        target = self.create_build_target(node, args, kwargs, targetclass)
+        self.add_target(target.name, target)
+        return target
+
+    def create_build_target(self, node: mparser.BaseNode, args: T.Tuple[str, SourcesVarargsType],
+                            kwargs: T.Dict[str, TYPE_var], targetclass: T.Type[BT]) -> BT:
         name, sources = args
         for_machine = kwargs['native']
         if kwargs.get('rust_crate_type') == 'proc-macro':
@@ -3408,16 +3471,17 @@ class Interpreter(InterpreterBase, HoldableObject):
         kwargs['dependencies'] = extract_as_list(kwargs, 'dependencies')
         kwargs['extra_files'] = self.source_strings_to_files(kwargs['extra_files'])
         self.check_sources_exist(os.path.join(self.source_root, self.subdir), sources)
-        if targetclass not in {build.Executable, build.SharedLibrary, build.SharedModule, build.StaticLibrary, build.Jar}:
+        if targetclass not in {build.Executable, build.SharedLibrary, build.SharedModule, build.StaticLibrary,
+                               build.Jar, build.AppBundle, build.FrameworkBundle}:
             mlog.debug('Unknown target type:', str(targetclass))
             raise RuntimeError('Unreachable code')
         self.__process_language_args(kwargs)
-        if targetclass is build.StaticLibrary:
+        if issubclass(targetclass, build.StaticLibrary):
             for lang in compilers.all_languages - {'java'}:
                 deps, args = self.__convert_file_args(kwargs.get(f'{lang}_static_args', []))
                 kwargs['language_args'][lang].extend(args)
                 kwargs['depend_files'].extend(deps)
-        elif targetclass is build.SharedLibrary:
+        elif issubclass(targetclass, build.SharedLibrary):
             for lang in compilers.all_languages - {'java'}:
                 deps, args = self.__convert_file_args(kwargs.get(f'{lang}_shared_args', []))
                 kwargs['language_args'][lang].extend(args)
@@ -3463,7 +3527,7 @@ class Interpreter(InterpreterBase, HoldableObject):
 
         kwargs['include_directories'] = self.extract_incdirs(kwargs)
 
-        if targetclass is build.Executable:
+        if issubclass(targetclass, build.Executable):
             kwargs = T.cast('kwtypes.Executable', kwargs)
             if kwargs['gui_app'] is not None:
                 if kwargs['win_subsystem'] is not None:
@@ -3494,9 +3558,6 @@ class Interpreter(InterpreterBase, HoldableObject):
                              self.environment, self.compilers[for_machine], kwargs)
         if objs and target.uses_rust():
             FeatureNew.single_use('objects in Rust targets', '1.8.0', self.subproject)
-
-        self.add_target(name, target)
-        self.project_args_frozen = True
         return target
 
     def add_stdlib_info(self, target):
