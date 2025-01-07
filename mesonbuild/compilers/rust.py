@@ -175,8 +175,11 @@ class RustCompiler(Compiler):
     def get_dependency_gen_args(self, outtarget: str, outfile: str) -> T.List[str]:
         return ['--emit', f'dep-info={outfile}']
 
+    @functools.lru_cache(maxsize=None)
     def get_output_args(self, outputname: str) -> T.List[str]:
         return ['--emit', f'link={outputname}']
+
+         return ['--dep-info', outfile]
 
     @functools.lru_cache(maxsize=None)
     def get_sysroot(self) -> str:
@@ -191,10 +194,13 @@ class RustCompiler(Compiler):
         return stdo.split('\n', maxsplit=1)[0]
 
     @functools.lru_cache(maxsize=None)
-    def get_crt_static(self) -> bool:
+    def get_cfgs(self) -> T.List[str]:
         cmd = self.get_exelist(ccache=False) + ['--print', 'cfg']
         p, stdo, stde = Popen_safe_logged(cmd)
-        return bool(re.search('^target_feature="crt-static"$', stdo, re.MULTILINE))
+        return stdo.splitlines()
+
+    def get_crt_static(self) -> bool:
+        return 'target_feature="crt-static"' in self.get_cfgs()
 
     def get_debug_args(self, is_debug: bool) -> T.List[str]:
         return clike_debug_args[is_debug]

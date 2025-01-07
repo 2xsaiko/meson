@@ -7,13 +7,14 @@ import re
 import subprocess, os.path
 import typing as T
 
-from .. import mlog
+from .. import mlog, options
 from ..mesonlib import EnvironmentException, first, MesonException, version_compare
 from .compilers import Compiler, clike_debug_args
 
 
 if T.TYPE_CHECKING:
     from .. import build
+    from ..coredata import MutableKeyedOptionDictType
     from ..dependencies import Dependency
     from ..envconfig import MachineInfo
     from ..environment import Environment
@@ -141,9 +142,28 @@ class SwiftCompiler(Compiler):
     def get_compile_only_args(self) -> T.List[str]:
         return ['-c']
 
+    def get_options(self) -> MutableKeyedOptionDictType:
+        opts = super().get_options()
+
+        key = self.form_compileropt_key('std')
+        opts[key] = options.UserComboOption(
+            self.make_option_name(key),
+            'Swift language version.',
+            'none',
+            # List them with swiftc -frontend -swift-version ''
+            choices=['none', '4', '4.2', '5', '6'])
+
+        return opts
+
     def get_option_compile_args(self, target: build.BuildTarget, env: Environment, subproject: T.Optional[str] = None
                                 ) -> T.List[str]:
         args: T.List[str] = []
+
+        std = self.get_compileropt_value('std', env, target, subproject)
+        assert isinstance(std, str)
+
+        if std != 'none':
+            args += ['-swift-version', std]
 
         # Pass C compiler args to swiftc, notably -std=...
         c_langs = ['objc', 'c']
