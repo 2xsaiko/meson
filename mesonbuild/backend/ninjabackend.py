@@ -2216,8 +2216,8 @@ class NinjaBackend(backends.Backend):
         return os.path.join(self.get_target_private_dir(target),
                             self.target_swift_modulename(target) + '.swiftmodule')
 
-    def target_swift_modulename(self, target):
-        return target.name
+    def target_swift_modulename(self, target: build.BuildTarget):
+        return target.name.replace(' ', '')
 
     def determine_swift_dep_modules(self, target):
         result = []
