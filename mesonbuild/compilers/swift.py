@@ -7,12 +7,14 @@ import re
 import subprocess, os.path
 import typing as T
 
-from .. import mlog
+from .. import mlog, options
 from ..mesonlib import EnvironmentException, MesonException, version_compare
 from .compilers import Compiler, clike_debug_args
 
 
 if T.TYPE_CHECKING:
+    from .. import build
+    from ..coredata import MutableKeyedOptionDictType
     from ..dependencies import Dependency
     from ..envconfig import MachineInfo
     from ..environment import Environment
@@ -114,6 +116,29 @@ class SwiftCompiler(Compiler):
 
     def get_compile_only_args(self) -> T.List[str]:
         return ['-c']
+
+    def get_options(self) -> MutableKeyedOptionDictType:
+        opts = super().get_options()
+
+        key = self.form_compileropt_key('lang_version')
+        opts[key] = options.UserStringOption(
+            self.make_option_name(key),
+            'Swift language version.',
+            '')
+
+        return opts
+
+    def get_option_compile_args(self, target: build.BuildTarget, env: Environment, subproject: T.Optional[str] = None
+                                ) -> T.List[str]:
+        args: T.List[str] = []
+
+        lang_version = self.get_compileropt_value('lang_version', env, target, subproject)
+        assert isinstance(lang_version, str)
+
+        if lang_version != '':
+            args += ['-swift-version', lang_version]
+
+        return args
 
     def get_working_directory_args(self, path: str) -> T.Optional[T.List[str]]:
         if version_compare(self.version, '<4.2'):
