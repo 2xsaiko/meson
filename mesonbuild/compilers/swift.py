@@ -123,6 +123,9 @@ class SwiftCompiler(Compiler):
         # Pass C compiler args to swiftc, notably -std=...
         try:
             c_langs = ['objc', 'c']
+            if self.supports_cxx_interoperability():
+                c_langs = ['objcpp', 'cpp', *c_langs]
+
             c_lang = next(lang for lang in c_langs if lang in target.compilers)
             cc = target.compilers[c_lang]
             args.extend(arg for c_arg in cc.get_option_compile_args(target, env, subproject) for arg in ['-Xcc', c_arg])
