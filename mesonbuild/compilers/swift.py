@@ -46,7 +46,7 @@ class SwiftCompiler(Compiler):
         self.version = version
         if self.info.is_darwin():
             try:
-                self.sdk_path = subprocess.check_output(['xcrun', '--show-sdk-path'],
+                self.sdk_path = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'],
                                                         universal_newlines=True,
                                                         encoding='utf-8', stderr=subprocess.STDOUT).strip()
             except subprocess.CalledProcessError as e:
@@ -55,6 +55,14 @@ class SwiftCompiler(Compiler):
             except FileNotFoundError:
                 mlog.error('xcrun not found. Install Xcode to compile Swift code.')
                 raise MesonException('Could not detect Xcode. Please install it to compile Swift code.')
+
+    def get_always_args(self) -> T.List[str]:
+        if self.info.is_darwin():
+            # SourceKit-LSP fails to work on macOS when compile_commands.json doesn't specify an SDK path.
+            # TODO: Submit an issue upstream...
+            return ['-sdk', self.sdk_path]
+        else:
+            return []
 
     def get_pic_args(self) -> T.List[str]:
         return []
